@@ -28,25 +28,26 @@ public class SolrMessageQueue extends RequestHandlerBase implements SolrCoreAwar
     protected String mqHost;
     protected ConnectionFactory factory;
     protected String queue;
-    protected String plugin_handler;
+    protected String pluginHandler;
     protected Boolean durable = Boolean.TRUE;
     protected SolrCore core;
 
     public SolrMessageQueue() {
+        super();
     }
 
     @Override
     public void init(NamedList args) {
         super.init(args);
+
         mqHost = (String) this.initArgs.get("messageQueueHost");
         queue = (String) this.initArgs.get("queue");
-        plugin_handler = (String) this.initArgs.get("updateHandlerName");
+        pluginHandler = (String) this.initArgs.get("requestHandlerName");
         factory = new ConnectionFactory();
         factory.setHost(mqHost);
 
         QueueListener listener = new QueueListener();
         listener.start();
-
     }
 
     @Override
@@ -69,50 +70,29 @@ public class SolrMessageQueue extends RequestHandlerBase implements SolrCoreAwar
         rsp.add("description", "This is a simple message queueing plugin for solr.");
         rsp.add("host", mqHost);
         rsp.add("queue", queue);
-        rsp.add("handler", plugin_handler);
+        rsp.add("handler", pluginHandler);
         rsp.add("durable", durable.toString());
     }
 
-    /**
-     * Performs the actual update request
-     * @param handler - name of the handler, like /update or /update/json. Should probably be loaded.
-     * @param params - the parameters, these can be parsed as custom message headers
-     * @param message - the actual message, at present only strings are allowed.
-     * @return SolrQueryResponse - returns the actiual response. Check the Exception to handle faults
-     */
-    public SolrQueryResponse performUpdateRequest(String handler, Map<String, String[]> params, String message) {
-
-        MultiMapSolrParams solrParams = new MultiMapSolrParams(params);
-        SolrRequestHandler requestHandler = core.getRequestHandler(handler);
-
+    public SolrQueryResponse performRequest() {
+        MultiMapSolrParams solrParams = new MultiMapSolrParams(new HashMap<String, String[]>() {{
+            put("command", new String[]{"delta-import"});
+        }});
         SolrQueryRequestBase request = new SolrQueryRequestBase(core, solrParams) {
         };
 
-        ContentStream stream = new ContentStreamBase.StringStream(message);
-        ArrayList<ContentStream> streams = new ArrayList<ContentStream>();
-        streams.add(stream);
-        request.setContentStreams(streams);
+        SolrRequestHandler requestHandler = core.getRequestHandler(pluginHandler);
+
         SolrQueryResponse response = new SolrQueryResponse();
 
         core.execute(requestHandler, request, response);
         return response;
     }
 
-    /**
-     * This gives us a handle to the SolrCore
-     *  @param core - the SolrCore
-     */
     public void inform(SolrCore core) {
         this.core = core;
     }
 
-    /**
-     * Listener thread. This is the core listener.
-     * Any message consumed spawns a new thread for handelling.
-     *
-     * @author rnoble
-     *
-     */
     private class QueueListener extends Thread {
         public void run() {
             Connection connection;
@@ -134,11 +114,6 @@ public class SolrMessageQueue extends RequestHandlerBase implements SolrCoreAwar
         }
     }
 
-    /**
-     * Worker thread. This is spawned for exach message consumed.
-     * @author rnoble
-     *
-     */
     private class QueueUpdateWorker extends Thread {
         QueueingConsumer.Delivery delivery;
 
@@ -148,28 +123,14 @@ public class SolrMessageQueue extends RequestHandlerBase implements SolrCoreAwar
         }
 
         public void run() {
-            String message = new String(delivery.getBody());
-            SolrQueryResponse result = performUpdateRequest(plugin_handler, getParams(), message);
-            //TODO: allow for the RPC round trip.
-            //also allow for failures.
-        }
+            SolrQueryResponse response = performRequest();
 
-        /**
-         * Extract the parameters from the custom headers, if any have been added.
-         * @return
-         */
-        private Map<String, String[]> getParams() {
-            Map<String, Object> headers = delivery.getProperties().getHeaders();
-
-            Map<String, String[]> params = new HashMap<String, String[]>();
-            if (headers != null) {
-                Set<String> keys = headers.keySet();
-                for (String key : keys) {
-                    Object value = headers.get(key);
-                    params.put(key, new String[]{value.toString()});
-                }
+            StringBuilder sb = new StringBuilder();
+            for (Object obj : response.getValues()) {
+                sb.append(obj);
             }
-            return params;
+            System.out.println(sb);
+            SolrCore.log.warn(sb.toString());
         }
     }
 }
