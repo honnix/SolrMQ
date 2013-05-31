@@ -1,15 +1,12 @@
 package org.apache.solr.handler.ext;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Map;
-import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.params.MultiMapSolrParams;
-import org.apache.solr.common.util.ContentStream;
-import org.apache.solr.common.util.ContentStreamBase;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.core.SolrCore;
 import org.apache.solr.handler.RequestHandlerBase;
@@ -18,22 +15,65 @@ import org.apache.solr.request.SolrQueryRequestBase;
 import org.apache.solr.request.SolrRequestHandler;
 import org.apache.solr.response.SolrQueryResponse;
 import org.apache.solr.util.plugin.SolrCoreAware;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.ConnectionFactory;
-import com.rabbitmq.client.QueueingConsumer;
+import com.rabbitmq.client.DefaultConsumer;
+import com.rabbitmq.client.Envelope;
 
 public class SolrMessageQueue extends RequestHandlerBase implements SolrCoreAware {
-    protected String mqHost;
-    protected ConnectionFactory factory;
-    protected String queue;
-    protected String pluginHandler;
-    protected Boolean durable = Boolean.TRUE;
-    protected SolrCore core;
+    private static final Logger LOGGER = LoggerFactory.getLogger(SolrMessageQueue.class);
+
+    private class QueueUpdateWorker implements Runnable {
+        public QueueUpdateWorker() {
+            super();
+        }
+
+        public void run() {
+            SolrQueryResponse response = performRequest();
+
+            StringBuilder sb = new StringBuilder();
+            for (Object obj : response.getValues()) {
+                sb.append(obj).append('\n');
+            }
+
+            LOGGER.info(sb.toString());
+        }
+
+        private SolrQueryResponse performRequest() {
+            MultiMapSolrParams solrParams = new MultiMapSolrParams(new HashMap<String, String[]>() {{
+                put("command", new String[]{"delta-import"});
+            }});
+            SolrQueryRequestBase request = new SolrQueryRequestBase(core, solrParams) {
+            };
+
+            SolrRequestHandler requestHandler = core.getRequestHandler(pluginHandler);
+
+            SolrQueryResponse response = new SolrQueryResponse();
+            core.execute(requestHandler, request, response);
+
+            return response;
+        }
+    }
+
+    private String mqHost;
+
+    private String queue;
+
+    private String pluginHandler;
+
+    private SolrCore core;
+
+    private ExecutorService executorService;
 
     public SolrMessageQueue() {
         super();
+
+        executorService = Executors.newFixedThreadPool(5);
     }
 
     @Override
@@ -43,11 +83,8 @@ public class SolrMessageQueue extends RequestHandlerBase implements SolrCoreAwar
         mqHost = (String) this.initArgs.get("messageQueueHost");
         queue = (String) this.initArgs.get("queue");
         pluginHandler = (String) this.initArgs.get("requestHandlerName");
-        factory = new ConnectionFactory();
-        factory.setHost(mqHost);
 
-        QueueListener listener = new QueueListener();
-        listener.start();
+        subscribe();
     }
 
     @Override
@@ -71,66 +108,35 @@ public class SolrMessageQueue extends RequestHandlerBase implements SolrCoreAwar
         rsp.add("host", mqHost);
         rsp.add("queue", queue);
         rsp.add("handler", pluginHandler);
-        rsp.add("durable", durable.toString());
-    }
-
-    public SolrQueryResponse performRequest() {
-        MultiMapSolrParams solrParams = new MultiMapSolrParams(new HashMap<String, String[]>() {{
-            put("command", new String[]{"delta-import"});
-        }});
-        SolrQueryRequestBase request = new SolrQueryRequestBase(core, solrParams) {
-        };
-
-        SolrRequestHandler requestHandler = core.getRequestHandler(pluginHandler);
-
-        SolrQueryResponse response = new SolrQueryResponse();
-
-        core.execute(requestHandler, request, response);
-        return response;
+        rsp.add("durable", Boolean.TRUE.toString());
     }
 
     public void inform(SolrCore core) {
         this.core = core;
     }
 
-    private class QueueListener extends Thread {
-        public void run() {
-            Connection connection;
-            try {
-                connection = factory.newConnection();
-                Channel channel = connection.createChannel();
-                channel.queueDeclare(queue, durable.booleanValue(), false, false, null);
-                QueueingConsumer consumer = new QueueingConsumer(channel);
-                channel.basicConsume(queue, true, consumer);
+    private void subscribe() {
+        ConnectionFactory factory = new ConnectionFactory();
+        factory.setHost(mqHost);
+        Connection connection;
 
-                while (true) {
-                    QueueingConsumer.Delivery delivery = consumer.nextDelivery();
-                    QueueUpdateWorker worker = new QueueUpdateWorker(delivery);
-                    worker.start();
+        try {
+            connection = factory.newConnection();
+            Channel channel = connection.createChannel();
+            channel.queueDeclare(queue, Boolean.TRUE.booleanValue(), false, false, null);
+            channel.basicConsume(queue, true, new DefaultConsumer(channel) {
+                @Override
+                public void handleDelivery(String consumerTag,
+                                           Envelope envelope,
+                                           AMQP.BasicProperties properties,
+                                           byte[] body)
+                        throws IOException {
+
+                    executorService.execute(new QueueUpdateWorker());
                 }
-            } catch (Exception e) {
-                SolrException.log(SolrCore.log, e.getMessage(), e);
-            }
-        }
-    }
-
-    private class QueueUpdateWorker extends Thread {
-        QueueingConsumer.Delivery delivery;
-
-        public QueueUpdateWorker(QueueingConsumer.Delivery delivery) {
-            super();
-            this.delivery = delivery;
-        }
-
-        public void run() {
-            SolrQueryResponse response = performRequest();
-
-            StringBuilder sb = new StringBuilder();
-            for (Object obj : response.getValues()) {
-                sb.append(obj);
-            }
-            System.out.println(sb);
-            SolrCore.log.warn(sb.toString());
+            });
+        } catch (Exception e) {
+            SolrException.log(LOGGER, e.getMessage(), e);
         }
     }
 }
