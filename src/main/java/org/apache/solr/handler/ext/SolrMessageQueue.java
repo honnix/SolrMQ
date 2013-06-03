@@ -136,11 +136,9 @@ public class SolrMessageQueue extends RequestHandlerBase implements SolrCoreAwar
                 }
             });
 
-            System.out.println("$$$$$$$$$$$$$$$$$$$$$$");
             core.addCloseHook(new CloseHook() {
                 @Override
                 public void preClose(SolrCore solrCore) {
-                    System.out.println("======================");
                     try {
                         channel.close();
                         connection.close();
@@ -151,7 +149,6 @@ public class SolrMessageQueue extends RequestHandlerBase implements SolrCoreAwar
 
                 @Override
                 public void postClose(SolrCore solrCore) {
-                    System.out.println("##########################");
                 }
             });
         } catch (Exception e) {
